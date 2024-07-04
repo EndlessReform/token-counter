@@ -10,12 +10,12 @@ struct Cli {
     #[arg(name = "FILE", default_value = "-")]
     files: Vec<String>,
 
-    /// Recursively process directories
-    #[arg(short, long)]
-    recursive: bool,
+    /// HuggingFace tokenizer model ID
+    #[arg(long, default_value = "DWDMaiMai/tiktoken_cl100k_base")]
+    model: String,
 }
 
-fn process_files(files: &[String], tokenizer: &Tokenizer, recursive: bool) -> io::Result<usize> {
+fn process_files(files: &[String], tokenizer: &Tokenizer) -> io::Result<usize> {
     let mut total_tokens = 0;
     let mut results = Vec::new();
 
@@ -34,20 +34,8 @@ fn process_files(files: &[String], tokenizer: &Tokenizer, recursive: bool) -> io
                 match entry {
                     Ok(path) => {
                         if path.is_dir() {
-                            if recursive {
-                                let dir_files: Vec<String> = fs::read_dir(&path)?
-                                    .filter_map(|e| {
-                                        e.ok().map(|d| d.path().to_string_lossy().into_owned())
-                                    })
-                                    .collect();
-                                let dir_tokens = process_files(&dir_files, tokenizer, recursive)?;
-                                total_tokens += dir_tokens;
-                            } else {
-                                results.push((
-                                    0,
-                                    format!("tc: {}: read: Is a directory", path.display()),
-                                ));
-                            }
+                            results
+                                .push((0, format!("tc: {}: read: Is a directory", path.display())));
                         } else {
                             let mut file = BufReader::new(File::open(&path)?);
                             let mut content = String::new();
@@ -90,8 +78,8 @@ fn main() {
 
     // Initialize tokenizer.
     // TODO: Graceful error handling once we have arguments
-    let tokenizer = Tokenizer::from_pretrained("BEE-spoke-data/cl100k_base", None).unwrap();
+    let tokenizer = Tokenizer::from_pretrained(&cli.model, None).unwrap();
 
     // Read input
-    process_files(&cli.files, &tokenizer, cli.recursive).unwrap();
+    process_files(&cli.files, &tokenizer).unwrap();
 }
