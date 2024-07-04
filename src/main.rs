@@ -1,8 +1,10 @@
 use clap::Parser;
 use glob::glob;
-use std::fs::{self, File};
+use rayon::prelude::*;
+use std::fs::File;
 use std::io::{self, BufReader, Read};
-use tokenizers::tokenizer::Tokenizer;
+use std::path::Path;
+use tokenizers::tokenizer::{Result as TokenizerResult, Tokenizer};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about=None)]
@@ -15,59 +17,62 @@ struct Cli {
     model: String,
 }
 
+fn count_tokens(content: &str, tokenizer: &Tokenizer) -> TokenizerResult<usize> {
+    let encoding = tokenizer.encode(content, false)?;
+    Ok(encoding.get_tokens().len())
+}
+
+fn process_file(path: &Path, tokenizer: &Tokenizer) -> io::Result<usize> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut buffer = String::new();
+    reader.read_to_string(&mut buffer)?;
+    Ok(count_tokens(&buffer, tokenizer).map_err(|e| io::Error::new(io::ErrorKind::Other, e))?)
+}
+
+fn stdin_tokens(tokenizer: &Tokenizer) -> io::Result<usize> {
+    let mut input = String::new();
+    io::stdin().read_to_string(&mut input)?;
+    count_tokens(&input, tokenizer).map_err(|e| io::Error::new(io::ErrorKind::Other, e))
+}
+
 fn process_files(files: &[String], tokenizer: &Tokenizer) -> io::Result<usize> {
-    let mut total_tokens = 0;
-    let mut results = Vec::new();
-
-    for pattern in files {
-        if pattern == "-" {
-            // Read from stdin
-            let mut input = String::new();
-            io::stdin().read_to_string(&mut input)?;
-            let encoding = tokenizer
-                .encode(input, false)
-                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-            let token_count = encoding.get_tokens().len();
-            println!("\t{}", token_count);
-        } else {
-            for entry in glob(pattern).map_err(|e| io::Error::new(io::ErrorKind::Other, e))? {
-                match entry {
-                    Ok(path) => {
-                        if path.is_dir() {
-                            results
-                                .push((0, format!("tc: {}: read: Is a directory", path.display())));
-                        } else {
-                            let mut file = BufReader::new(File::open(&path)?);
-                            let mut content = String::new();
-                            file.read_to_string(&mut content)?;
-                            let encoding = tokenizer
-                                .encode(content, false)
-                                .map_err(|e| io::Error::new(io::ErrorKind::Other, e))?;
-                            let token_count = encoding.get_tokens().len();
-                            results.push((token_count, path.to_string_lossy().into_owned()));
-                            total_tokens += token_count;
-                        }
-                    }
-                    Err(e) => eprint!("{:?}", e),
-                }
+    let results: Vec<_> = files
+        .par_iter()
+        .flat_map(|pattern| {
+            if pattern == "-" {
+                vec![Ok((None, stdin_tokens(tokenizer)))]
+            } else {
+                glob(pattern)
+                    .into_iter()
+                    .flatten()
+                    .map(|entry| {
+                        entry.map(|path| (Some(path.clone()), process_file(&path, tokenizer)))
+                    })
+                    .collect::<Vec<_>>()
             }
-        }
-    }
-    // Find the maximum token count to determine column width
-    let max_tokens = results.iter().map(|(count, _)| *count).max().unwrap_or(0);
-    let width = max_tokens.to_string().len();
+        })
+        .collect();
 
-    // Print results
-    for (count, name) in results {
-        if name.contains("Is a directory") {
-            println!("{}", name);
-        } else {
-            println!("{:width$} {}", count, name, width = width);
+    let mut total_tokens = 0;
+    for result in results {
+        match result {
+            Ok((path, Ok(count))) => match path {
+                Some(path) => {
+                    println!("{:8} {}", count, path.display());
+                    total_tokens += count;
+                }
+                None => {
+                    println!("{:8}", count);
+                }
+            },
+            Err(e) => eprintln!("Error: {:?}", e),
+            Ok((_, Err(e))) => eprintln!("Error processing file: {:?}", e),
         }
     }
 
     if files.len() > 1 {
-        println!("{:width$} total", total_tokens, width = width);
+        println!("{:8} total", total_tokens);
     }
 
     Ok(total_tokens)
