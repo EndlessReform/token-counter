@@ -5,6 +5,7 @@ use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::Path;
 use tokenizers::tokenizer::{Result as TokenizerResult, Tokenizer};
+use std::time::Instant;
 
 #[derive(Parser)]
 #[command(author, version, about, long_about=None)]
@@ -37,15 +38,20 @@ fn stdin_tokens(tokenizer: &Tokenizer) -> io::Result<usize> {
 }
 
 fn process_files(files: &[String], tokenizer: &Tokenizer) -> io::Result<usize> {
+    let glob_start = Instant::now();
     let results: Vec<_> = files
         .par_iter()
         .flat_map(|pattern| {
             if pattern == "-" {
                 vec![Ok((None, stdin_tokens(tokenizer)))]
             } else {
-                glob(pattern)
-                    .into_iter()
-                    .flatten()
+                let glob_pattern_start = Instant::now();
+                let paths: Vec<_> = glob(pattern).into_iter().flatten().collect();
+                let glob_pattern_duration = glob_pattern_start.elapsed();
+                eprintln!("Glob expansion for '{}' took {:?}", pattern, glob_pattern_duration);
+
+                paths
+                    .into_par_iter()
                     .map(|entry| {
                         entry.map(|path| (Some(path.clone()), process_file(&path, tokenizer)))
                     })
@@ -53,6 +59,8 @@ fn process_files(files: &[String], tokenizer: &Tokenizer) -> io::Result<usize> {
             }
         })
         .collect();
+    let glob_duration = glob_start.elapsed();
+    eprintln!("Total glob expansion took {:?}", glob_duration);
 
     let mut total_tokens = 0;
     for result in results {
