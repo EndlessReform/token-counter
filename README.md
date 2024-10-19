@@ -26,6 +26,9 @@ Using globs:
 
 ```
 tc *.md
+
+# number of threads for parallel glob expansion
+RAYON_NUM_THREADS=8 tc *.md
 ```
 
 Arguments:
