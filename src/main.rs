@@ -1,8 +1,7 @@
 use clap::Parser;
 use std::io::{self, Write};
 use std::process::ExitCode;
-use token_counter::{expand_inputs, process_inputs, CountResult, DEFAULT_MODEL};
-use tokenizers::Tokenizer;
+use token_counter::{expand_inputs, load_tokenizer, process_inputs, CountResult, DEFAULT_MODEL};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about=None)]
@@ -65,7 +64,7 @@ fn main() -> ExitCode {
         };
     }
 
-    let tokenizer = match Tokenizer::from_pretrained(&cli.model, None) {
+    let tokenizer = match load_tokenizer(&cli.model) {
         Ok(tokenizer) => tokenizer,
         Err(error) => {
             eprintln!("tc: failed to load tokenizer '{}': {error}", cli.model);

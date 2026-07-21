@@ -6,6 +6,17 @@ use std::path::{Path, PathBuf};
 use tokenizers::Tokenizer;
 
 pub const DEFAULT_MODEL: &str = "Xenova/gpt-4o";
+const DEFAULT_TOKENIZER_JSON: &[u8] =
+    include_bytes!("../assets/tokenizers/xenova-gpt-4o/tokenizer.json");
+
+/// Loads the bundled default tokenizer or downloads a requested alternative.
+pub fn load_tokenizer(model: &str) -> tokenizers::Result<Tokenizer> {
+    if model == DEFAULT_MODEL {
+        Tokenizer::from_bytes(DEFAULT_TOKENIZER_JSON)
+    } else {
+        Tokenizer::from_pretrained(model, None)
+    }
+}
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Input {
@@ -149,6 +160,16 @@ mod tests {
         let mut tokenizer = Tokenizer::new(model);
         tokenizer.with_pre_tokenizer(Some(Whitespace {}));
         tokenizer
+    }
+
+    #[test]
+    fn bundled_default_tokenizer_matches_o200k() {
+        let tokenizer = load_tokenizer(DEFAULT_MODEL).expect("bundled tokenizer is valid");
+        let encoding = tokenizer
+            .encode("hello world", false)
+            .expect("text can be encoded");
+
+        assert_eq!(encoding.get_ids(), &[24912, 2375]);
     }
 
     #[test]

@@ -6,6 +6,7 @@
 
 - Count tokens in files or from stdin
 - Support for multiple files and glob patterns
+- Works offline with the bundled GPT-4o tokenizer
 - Uses any tokenizer available through Hugging Face Tokenizers
 
 ## Installation
@@ -38,4 +39,6 @@ Arguments:
 
 - `-m`, `--model`: Hugging Face model ID for the tokenizer (default: `Xenova/gpt-4o`; ex. `google-bert/bert-base-uncased`)
 
-Tokenizers are downloaded from Hugging Face on first use and then cached. Counts do not include model-specific special tokens.
+The default GPT-4o tokenizer is bundled and does not require a network connection.
+Alternative tokenizers selected with `--model` are downloaded from Hugging Face
+on first use and then cached. Counts do not include model-specific special tokens.
