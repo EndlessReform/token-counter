@@ -1,5 +1,4 @@
 use rayon::prelude::*;
-use std::collections::BTreeMap;
 use std::env;
 use std::fs;
 use std::hint::black_box;
@@ -17,8 +16,7 @@ type Counts = Vec<(PathBuf, usize)>;
 
 fn git_output(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, String> {
     let mut command = Command::new("git");
-    command.args(["-C", root.to_str().ok_or("fixture path is not UTF-8")?]);
-    command.args(arguments);
+    command.current_dir(root).args(arguments);
     let output = command
         .output()
         .map_err(|error| format!("failed to run git: {error}"))?;
@@ -29,11 +27,13 @@ fn git_output(root: &Path, arguments: &[&str]) -> Result<Vec<u8>, String> {
 }
 
 fn tracked_fixture_files(root: &Path) -> Result<Vec<PathBuf>, String> {
-    let mut files: Vec<_> = git_output(root, &["ls-files", "-z"])?
-        .split(|byte| *byte == 0)
+    let output = String::from_utf8(git_output(root, &["ls-files", "-z"])?)
+        .map_err(|error| format!("fixture paths are not UTF-8: {error}"))?;
+    let mut files: Vec<_> = output
+        .split('\0')
         .filter(|path| !path.is_empty())
         .filter_map(|path| {
-            let relative = PathBuf::from(String::from_utf8_lossy(path).into_owned());
+            let relative = PathBuf::from(path);
             let included = relative
                 .extension()
                 .and_then(|extension| extension.to_str())
@@ -68,13 +68,6 @@ fn parallel(files: &[PathBuf], tokenizer: &Tokenizer) -> Result<Counts, String> 
         .collect()
 }
 
-fn canonicalize(counts: &Counts) -> BTreeMap<&Path, usize> {
-    counts
-        .iter()
-        .map(|(path, count)| (path.as_path(), *count))
-        .collect()
-}
-
 fn timed(operation: impl FnOnce() -> Result<Counts, String>) -> Result<(Duration, Counts), String> {
     let start = Instant::now();
     let counts = operation()?;
@@ -93,12 +86,28 @@ fn change(sequential: Duration, parallel: Duration) -> f64 {
 }
 
 fn verify(left: &Counts, right: &Counts) -> Result<usize, String> {
-    let left = canonicalize(left);
-    let right = canonicalize(right);
     if left != right {
-        return Err("sequential and parallel path/count mappings differ".to_owned());
+        return Err("sequential and parallel results differ".to_owned());
     }
-    Ok(left.values().sum())
+    Ok(left.iter().map(|(_, count)| count).sum())
+}
+
+fn compare(
+    files: &[PathBuf],
+    tokenizer: &Tokenizer,
+    parallel_first: bool,
+) -> Result<(Duration, Duration), String> {
+    let (sequential_result, parallel_result) = if parallel_first {
+        let parallel_result = timed(|| parallel(files, tokenizer))?;
+        let sequential_result = timed(|| sequential(files, tokenizer))?;
+        (sequential_result, parallel_result)
+    } else {
+        let sequential_result = timed(|| sequential(files, tokenizer))?;
+        let parallel_result = timed(|| parallel(files, tokenizer))?;
+        (sequential_result, parallel_result)
+    };
+    verify(&sequential_result.1, &parallel_result.1)?;
+    Ok((sequential_result.0, parallel_result.0))
 }
 
 fn main() -> Result<(), String> {
@@ -109,11 +118,12 @@ fn main() -> Result<(), String> {
     };
     let fixture_root = PathBuf::from(fixture_root);
     let tokenizer_file = PathBuf::from(args.next().ok_or("missing tokenizer.json path")?);
-    let iterations: usize = args
-        .next()
-        .unwrap_or_else(|| "15".to_owned())
-        .parse()
-        .map_err(|error| format!("invalid iteration count: {error}"))?;
+    let iterations: usize = match args.next() {
+        Some(value) => value
+            .parse()
+            .map_err(|error| format!("invalid iteration count: {error}"))?,
+        None => 15,
+    };
     if iterations < 3 {
         return Err("iteration count must be at least 3".to_owned());
     }
@@ -122,13 +132,12 @@ fn main() -> Result<(), String> {
     if files.is_empty() {
         return Err("fixture contains no selected files".to_owned());
     }
-    let bytes: u64 = files
+    let sizes: Vec<_> = files
         .iter()
         .map(|path| fs::metadata(path).map(|metadata| metadata.len()))
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| format!("failed to inspect fixture: {error}"))?
-        .into_iter()
-        .sum();
+        .collect::<Result<_, _>>()
+        .map_err(|error| format!("failed to inspect fixture: {error}"))?;
+    let bytes: u64 = sizes.iter().sum();
     let revision = String::from_utf8(git_output(&fixture_root, &["rev-parse", "HEAD"])?)
         .map_err(|error| format!("fixture revision is not UTF-8: {error}"))?;
     if revision.trim() != EXPECTED_REVISION
@@ -143,12 +152,10 @@ fn main() -> Result<(), String> {
     }
     let largest = files
         .iter()
-        .max_by_key(|path| {
-            fs::metadata(path)
-                .map(|metadata| metadata.len())
-                .unwrap_or(0)
-        })
-        .expect("fixture is non-empty")
+        .zip(sizes)
+        .max_by_key(|(_, size)| *size)
+        .ok_or("fixture contains no selected files")?
+        .0
         .clone();
     let tokenizer = Tokenizer::from_file(&tokenizer_file)
         .map_err(|error| format!("failed to load tokenizer: {error}"))?;
@@ -174,41 +181,17 @@ fn main() -> Result<(), String> {
 
     for sample in 0..iterations {
         let parallel_first = sample % 2 == 1;
-        let (sequential_result, parallel_result) = if parallel_first {
-            let parallel_result = timed(|| parallel(&files, &tokenizer))?;
-            let sequential_result = timed(|| sequential(&files, &tokenizer))?;
-            (sequential_result, parallel_result)
-        } else {
-            let sequential_result = timed(|| sequential(&files, &tokenizer))?;
-            let parallel_result = timed(|| parallel(&files, &tokenizer))?;
-            (sequential_result, parallel_result)
-        };
-        verify(&sequential_result.1, &parallel_result.1)?;
-        println!(
-            "multi,{sample},sequential,{}",
-            sequential_result.0.as_nanos()
-        );
-        println!("multi,{sample},parallel,{}", parallel_result.0.as_nanos());
-        multi_sequential.push(sequential_result.0);
-        multi_parallel.push(parallel_result.0);
+        let (sequential_time, parallel_time) = compare(&files, &tokenizer, parallel_first)?;
+        println!("multi,{sample},sequential,{}", sequential_time.as_nanos());
+        println!("multi,{sample},parallel,{}", parallel_time.as_nanos());
+        multi_sequential.push(sequential_time);
+        multi_parallel.push(parallel_time);
 
-        let (sequential_result, parallel_result) = if parallel_first {
-            let parallel_result = timed(|| parallel(&single, &tokenizer))?;
-            let sequential_result = timed(|| sequential(&single, &tokenizer))?;
-            (sequential_result, parallel_result)
-        } else {
-            let sequential_result = timed(|| sequential(&single, &tokenizer))?;
-            let parallel_result = timed(|| parallel(&single, &tokenizer))?;
-            (sequential_result, parallel_result)
-        };
-        verify(&sequential_result.1, &parallel_result.1)?;
-        println!(
-            "single,{sample},sequential,{}",
-            sequential_result.0.as_nanos()
-        );
-        println!("single,{sample},parallel,{}", parallel_result.0.as_nanos());
-        single_sequential.push(sequential_result.0);
-        single_parallel.push(parallel_result.0);
+        let (sequential_time, parallel_time) = compare(&single, &tokenizer, parallel_first)?;
+        println!("single,{sample},sequential,{}", sequential_time.as_nanos());
+        println!("single,{sample},parallel,{}", parallel_time.as_nanos());
+        single_sequential.push(sequential_time);
+        single_parallel.push(parallel_time);
     }
 
     let multi_sequential = median(&mut multi_sequential);

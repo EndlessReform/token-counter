@@ -1,5 +1,8 @@
 use glob::glob;
+use ignore::WalkBuilder;
 use rayon::prelude::*;
+use std::collections::HashSet;
+use std::fmt;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
@@ -22,18 +25,32 @@ pub fn load_tokenizer(model: &str) -> tokenizers::Result<Tokenizer> {
 pub enum Input {
     Stdin,
     File(PathBuf),
+    DiscoveredFile(PathBuf),
 }
 
 impl Input {
-    pub fn label(&self) -> String {
-        match self {
-            Self::Stdin => "-".to_owned(),
-            Self::File(path) => path.display().to_string(),
-        }
-    }
-
     pub fn is_stdin(&self) -> bool {
         matches!(self, Self::Stdin)
+    }
+
+    pub fn is_discovered(&self) -> bool {
+        matches!(self, Self::DiscoveredFile(_))
+    }
+
+    fn path(&self) -> Option<&Path> {
+        match self {
+            Self::Stdin => None,
+            Self::File(path) | Self::DiscoveredFile(path) => Some(path),
+        }
+    }
+}
+
+impl fmt::Display for Input {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Stdin => formatter.write_str("-"),
+            Self::File(path) | Self::DiscoveredFile(path) => path.display().fmt(formatter),
+        }
     }
 }
 
@@ -70,7 +87,74 @@ fn has_glob_metacharacters(value: &str) -> bool {
     value.contains(['*', '?', '['])
 }
 
-pub fn expand_inputs(files: &[String]) -> (Vec<Input>, Vec<String>) {
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct ExpansionOptions {
+    pub recursive: bool,
+    pub gitignore: bool,
+}
+
+fn walk_paths(
+    path: &Path,
+    respect_gitignore: bool,
+    include: impl Fn(&ignore::DirEntry) -> bool,
+) -> (Vec<PathBuf>, Vec<String>) {
+    let mut builder = WalkBuilder::new(path);
+    builder
+        .hidden(false)
+        .ignore(false)
+        .git_ignore(respect_gitignore)
+        .git_global(false)
+        .git_exclude(false)
+        .parents(respect_gitignore)
+        .require_git(false);
+    if respect_gitignore {
+        builder.filter_entry(|entry| {
+            !(entry.file_type().is_some_and(|kind| kind.is_dir()) && entry.file_name() == ".git")
+        });
+    }
+
+    let mut paths = Vec::new();
+    let mut errors = Vec::new();
+    for entry in builder.build() {
+        match entry {
+            Ok(entry) if include(&entry) => {
+                paths.push(entry.into_path());
+            }
+            Ok(_) => {}
+            Err(error) => errors.push(error.to_string()),
+        }
+    }
+    paths.sort();
+    (paths, errors)
+}
+
+fn walk_directory(path: &Path, respect_gitignore: bool) -> (Vec<PathBuf>, Vec<String>) {
+    walk_paths(path, respect_gitignore, |entry| entry.path().is_file())
+}
+
+fn gitignored_glob_matches(pattern: &str) -> (HashSet<PathBuf>, Vec<String>) {
+    let root = pattern
+        .split(['*', '?', '['])
+        .next()
+        .map(|prefix| {
+            let path = PathBuf::from(prefix);
+            if prefix.ends_with(std::path::MAIN_SEPARATOR) {
+                path
+            } else {
+                path.parent().map(Path::to_path_buf).unwrap_or_default()
+            }
+        })
+        .filter(|path| !path.as_os_str().is_empty())
+        .unwrap_or_else(|| PathBuf::from("."));
+
+    let (paths, errors) = walk_paths(&root, true, |_| true);
+    (paths.into_iter().collect(), errors)
+}
+
+pub fn expand_inputs_with_options(
+    files: &[String],
+    options: ExpansionOptions,
+) -> (Vec<Input>, Vec<String>) {
     let mut inputs = Vec::new();
     let mut errors = Vec::new();
 
@@ -78,6 +162,15 @@ pub fn expand_inputs(files: &[String]) -> (Vec<Input>, Vec<String>) {
         if value == "-" {
             inputs.push(Input::Stdin);
         } else if has_glob_metacharacters(value) {
+            let allowed = options.gitignore.then(|| {
+                let (paths, walk_errors) = gitignored_glob_matches(value);
+                errors.extend(
+                    walk_errors
+                        .into_iter()
+                        .map(|error| format!("{value}: {error}")),
+                );
+                paths
+            });
             match glob(value) {
                 Ok(paths) => {
                     let mut matched = false;
@@ -86,13 +179,27 @@ pub fn expand_inputs(files: &[String]) -> (Vec<Input>, Vec<String>) {
                         match entry {
                             Ok(path) => {
                                 matched = true;
-                                matched_paths.push(path);
+                                if allowed.as_ref().is_none_or(|paths| paths.contains(&path)) {
+                                    matched_paths.push(path);
+                                }
                             }
                             Err(error) => errors.push(format!("{value}: {error}")),
                         }
                     }
                     matched_paths.sort();
-                    inputs.extend(matched_paths.into_iter().map(Input::File));
+                    for path in matched_paths {
+                        if options.recursive && path.is_dir() {
+                            let (walked, walk_errors) = walk_directory(&path, options.gitignore);
+                            inputs.extend(walked.into_iter().map(Input::DiscoveredFile));
+                            errors.extend(
+                                walk_errors
+                                    .into_iter()
+                                    .map(|error| format!("{value}: {error}")),
+                            );
+                        } else {
+                            inputs.push(Input::DiscoveredFile(path));
+                        }
+                    }
                     if !matched {
                         errors.push(format!("{value}: no matches"));
                     }
@@ -100,11 +207,26 @@ pub fn expand_inputs(files: &[String]) -> (Vec<Input>, Vec<String>) {
                 Err(error) => errors.push(format!("{value}: invalid glob: {error}")),
             }
         } else {
-            inputs.push(Input::File(PathBuf::from(value)));
+            let path = PathBuf::from(value);
+            if options.recursive && path.is_dir() {
+                let (walked, walk_errors) = walk_directory(&path, options.gitignore);
+                inputs.extend(walked.into_iter().map(Input::DiscoveredFile));
+                errors.extend(
+                    walk_errors
+                        .into_iter()
+                        .map(|error| format!("{value}: {error}")),
+                );
+            } else {
+                inputs.push(Input::File(path));
+            }
         }
     }
 
     (inputs, errors)
+}
+
+pub fn expand_inputs(files: &[String]) -> (Vec<Input>, Vec<String>) {
+    expand_inputs_with_options(files, ExpansionOptions::default())
 }
 
 /// Counts all inputs, processing files in parallel while reading stdin only once.
@@ -116,38 +238,27 @@ pub fn process_inputs(
     tokenizer: &Tokenizer,
     mut stdin: impl Read,
 ) -> Vec<CountResult> {
-    let mut results: Vec<Option<CountResult>> = (0..inputs.len()).map(|_| None).collect();
-    let mut stdin_read = false;
-
-    for (index, input) in inputs.iter().enumerate() {
-        if input.is_stdin() {
-            let result = if stdin_read {
-                Ok(0)
-            } else {
-                stdin_read = true;
-                count_reader(&mut stdin, tokenizer)
-            };
-            results[index] = Some((input.clone(), result));
-        }
-    }
+    let mut results: Vec<_> = inputs
+        .iter()
+        .enumerate()
+        .filter(|(_, input)| input.is_stdin())
+        .map(|(index, input)| (index, (input.clone(), count_reader(&mut stdin, tokenizer))))
+        .collect();
 
     let file_results: Vec<_> = inputs
         .par_iter()
         .enumerate()
         .filter_map(|(index, input)| match input {
             Input::Stdin => None,
-            Input::File(path) => Some((index, input.clone(), count_file(path, tokenizer))),
+            Input::File(path) | Input::DiscoveredFile(path) => {
+                Some((index, (input.clone(), count_file(path, tokenizer))))
+            }
         })
         .collect();
+    results.extend(file_results);
 
-    for (index, input, result) in file_results {
-        results[index] = Some((input, result));
-    }
-
-    results
-        .into_iter()
-        .map(|result| result.expect("every input is processed exactly once"))
-        .collect()
+    results.sort_unstable_by_key(|(index, _)| *index);
+    results.into_iter().map(|(_, result)| result).collect()
 }
 
 /// Tokenizes all inputs, emitting stdin results first and file results as they complete.
@@ -160,22 +271,14 @@ pub fn process_inputs_as_completed(
     mut stdin: impl Read,
     emit: impl Fn(EncodingResult) + Sync,
 ) {
-    let mut stdin_read = false;
-
     for input in inputs {
         if input.is_stdin() {
-            let result = if stdin_read {
-                Ok(Encoding::default())
-            } else {
-                stdin_read = true;
-                encode_reader(&mut stdin, tokenizer)
-            };
-            emit((input.clone(), result));
+            emit((input.clone(), encode_reader(&mut stdin, tokenizer)));
         }
     }
 
     inputs.par_iter().for_each(|input| {
-        if let Input::File(path) = input {
+        if let Some(path) = input.path() {
             emit((input.clone(), encode_file(path, tokenizer)));
         }
     });
@@ -184,7 +287,9 @@ pub fn process_inputs_as_completed(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
     use std::io::Cursor;
+    use tempfile::TempDir;
     use tokenizers::models::bpe::BPE;
     use tokenizers::pre_tokenizers::whitespace::Whitespace;
 
@@ -223,8 +328,8 @@ mod tests {
         let (inputs, errors) = expand_inputs(&files);
 
         assert!(errors.is_empty());
-        assert!(inputs.contains(&Input::File(PathBuf::from("src/main.rs"))));
-        assert!(inputs.contains(&Input::File(PathBuf::from("src/lib.rs"))));
+        assert!(inputs.contains(&Input::DiscoveredFile(PathBuf::from("src/main.rs"))));
+        assert!(inputs.contains(&Input::DiscoveredFile(PathBuf::from("src/lib.rs"))));
         assert!(inputs.contains(&Input::Stdin));
     }
 
@@ -238,8 +343,8 @@ mod tests {
         assert_eq!(
             inputs,
             [
-                Input::File(PathBuf::from("src/lib.rs")),
-                Input::File(PathBuf::from("src/main.rs")),
+                Input::DiscoveredFile(PathBuf::from("src/lib.rs")),
+                Input::DiscoveredFile(PathBuf::from("src/main.rs")),
             ]
         );
     }
@@ -254,6 +359,88 @@ mod tests {
         assert_eq!(errors.len(), 2);
         assert!(errors[0].contains("invalid glob"));
         assert!(errors[1].contains("no matches"));
+    }
+
+    #[test]
+    fn recursively_expands_directories_in_lexical_order() {
+        let directory = TempDir::new().unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
+        fs::write(directory.path().join("z.txt"), "z").unwrap();
+        fs::write(directory.path().join("a.txt"), "a").unwrap();
+        fs::write(directory.path().join("nested/m.txt"), "m").unwrap();
+
+        let (inputs, errors) = expand_inputs_with_options(
+            &[directory.path().display().to_string()],
+            ExpansionOptions {
+                recursive: true,
+                gitignore: false,
+            },
+        );
+
+        assert!(errors.is_empty());
+        assert_eq!(
+            inputs,
+            [
+                Input::DiscoveredFile(directory.path().join("a.txt")),
+                Input::DiscoveredFile(directory.path().join("nested/m.txt")),
+                Input::DiscoveredFile(directory.path().join("z.txt")),
+            ]
+        );
+    }
+
+    #[test]
+    fn gitignore_filters_discovered_files_but_not_explicit_files() {
+        let directory = TempDir::new().unwrap();
+        let kept = directory.path().join("kept.txt");
+        let ignored = directory.path().join("ignored.txt");
+        fs::write(directory.path().join(".gitignore"), "ignored.txt\n").unwrap();
+        fs::write(&kept, "kept").unwrap();
+        fs::write(&ignored, "ignored").unwrap();
+
+        let pattern = format!("{}/*.txt", directory.path().display());
+        let (glob_inputs, errors) = expand_inputs_with_options(
+            &[pattern],
+            ExpansionOptions {
+                recursive: false,
+                gitignore: true,
+            },
+        );
+        assert!(errors.is_empty());
+        assert_eq!(glob_inputs, [Input::DiscoveredFile(kept)]);
+
+        let (explicit_inputs, errors) = expand_inputs_with_options(
+            &[ignored.display().to_string()],
+            ExpansionOptions {
+                recursive: false,
+                gitignore: true,
+            },
+        );
+        assert!(errors.is_empty());
+        assert_eq!(explicit_inputs, [Input::File(ignored)]);
+    }
+
+    #[test]
+    fn recursive_gitignore_uses_nested_precedence() {
+        let directory = TempDir::new().unwrap();
+        fs::create_dir(directory.path().join("nested")).unwrap();
+        fs::write(directory.path().join(".gitignore"), "*.log\n").unwrap();
+        fs::write(directory.path().join("root.log"), "ignored").unwrap();
+        fs::write(directory.path().join("nested/.gitignore"), "!keep.log\n").unwrap();
+        fs::write(directory.path().join("nested/keep.log"), "kept").unwrap();
+
+        let (inputs, errors) = expand_inputs_with_options(
+            &[directory.path().display().to_string()],
+            ExpansionOptions {
+                recursive: true,
+                gitignore: true,
+            },
+        );
+
+        assert!(errors.is_empty());
+        assert!(!inputs.contains(&Input::DiscoveredFile(directory.path().join("root.log"))));
+        assert!(inputs.contains(&Input::DiscoveredFile(
+            directory.path().join("nested/keep.log")
+        )));
     }
 
     #[test]

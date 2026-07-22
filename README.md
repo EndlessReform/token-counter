@@ -6,6 +6,8 @@
 
 - Count tokens in files or from stdin
 - Support for multiple files and glob patterns
+- Recursively walk directories, with optional `.gitignore` filtering
+- Emit count-only, cost-estimate, or streaming JSONL output
 - Works offline with the bundled GPT-4o tokenizer
 - Uses any tokenizer available through Hugging Face Tokenizers
 
@@ -29,6 +31,20 @@ Using globs (quote the pattern if you want `tc`, rather than your shell, to expa
 tc '*.md'
 ```
 
+Recursively counting files while respecting `.gitignore` rules:
+
+```
+tc -r --gitignore src docs
+```
+
+Printing counts without filenames, or estimating spend at $2.50 per million
+tokens:
+
+```
+tc -c '*.md'
+tc --cost-per-mtok 2.50 '*.md'
+```
+
 Reading from standard input:
 
 ```
@@ -38,6 +54,10 @@ printf 'Hello, world!' | tc
 Arguments:
 
 - `-m`, `--model`: Hugging Face model ID for the tokenizer (default: `Xenova/gpt-4o`; ex. `google-bert/bert-base-uncased`)
+- `-r`, `--recursive`: Recursively process files beneath directory operands
+- `-c`, `--count-only`: Print counts without filenames or a total (incompatible with `--jsonl`)
+- `--gitignore`: Skip gitignored files found through globs or recursive walking; explicitly named files are still processed
+- `--cost-per-mtok PRICE`: Print estimated USD cost at the given price per million tokens, or add `cost_usd` to JSONL records
 - `--jsonl`: Emit one `{"path": ..., "n_tokens": ...}` object per input as it completes
 - `--show-tokens`: Include tokenizer vocabulary strings in JSONL output
 - `--show-token-ids`: Include numeric token IDs in JSONL output
