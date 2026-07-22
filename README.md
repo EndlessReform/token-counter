@@ -38,6 +38,17 @@ printf 'Hello, world!' | tc
 Arguments:
 
 - `-m`, `--model`: Hugging Face model ID for the tokenizer (default: `Xenova/gpt-4o`; ex. `google-bert/bert-base-uncased`)
+- `--jsonl`: Emit one `{"path": ..., "n_tokens": ...}` object per input as it completes
+- `--show-tokens`: Include tokenizer vocabulary strings in JSONL output
+- `--show-token-ids`: Include numeric token IDs in JSONL output
+
+The default output preserves operand order and uses lexical order for matches
+within each glob. JSONL output is streamed in nondeterministic completion order,
+contains no total record, and writes diagnostics to standard error.
+`--show-tokens` and `--show-token-ids` require `--jsonl`; when both are used,
+their arrays align by index. Token strings are the tokenizer's vocabulary
+representations and may contain markers such as `Ġ`, rather than clean decoded
+substrings.
 
 The default GPT-4o tokenizer is bundled and does not require a network connection.
 Alternative tokenizers selected with `--model` are downloaded from Hugging Face

@@ -1242,6 +1242,8 @@ dependencies = [
  "clap",
  "glob",
  "rayon",
+ "serde",
+ "serde_json",
  "tokenizers",
 ]
 

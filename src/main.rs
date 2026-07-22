@@ -1,7 +1,12 @@
 use clap::Parser;
+use serde::Serialize;
 use std::io::{self, Write};
 use std::process::ExitCode;
-use token_counter::{expand_inputs, load_tokenizer, process_inputs, CountResult, DEFAULT_MODEL};
+use std::sync::Mutex;
+use token_counter::{
+    expand_inputs, load_tokenizer, process_inputs, process_inputs_as_completed, CountResult,
+    EncodingResult, DEFAULT_MODEL,
+};
 
 #[derive(Parser)]
 #[command(author, version, about, long_about=None)]
@@ -12,6 +17,28 @@ struct Cli {
     /// Hugging Face tokenizer model ID
     #[arg(short = 'm', long, default_value = DEFAULT_MODEL)]
     model: String,
+
+    /// Emit one JSON object per input as processing completes
+    #[arg(long)]
+    jsonl: bool,
+
+    /// Include tokenizer vocabulary strings in JSONL output
+    #[arg(long, requires = "jsonl")]
+    show_tokens: bool,
+
+    /// Include numeric token IDs in JSONL output
+    #[arg(long, requires = "jsonl")]
+    show_token_ids: bool,
+}
+
+#[derive(Serialize)]
+struct JsonlRecord<'a> {
+    path: &'a str,
+    n_tokens: usize,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tokens: Option<&'a [String]>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token_ids: Option<&'a [u32]>,
 }
 
 fn write_results(
@@ -48,6 +75,36 @@ fn write_results(
     Ok(had_error)
 }
 
+fn write_jsonl_result(
+    (input, result): EncodingResult,
+    show_tokens: bool,
+    show_token_ids: bool,
+    mut stdout: impl Write,
+    mut stderr: impl Write,
+) -> io::Result<bool> {
+    let name = input.label();
+    match result {
+        Ok(encoding) => {
+            serde_json::to_writer(
+                &mut stdout,
+                &JsonlRecord {
+                    path: &name,
+                    n_tokens: encoding.len(),
+                    tokens: show_tokens.then(|| encoding.get_tokens()),
+                    token_ids: show_token_ids.then(|| encoding.get_ids()),
+                },
+            )?;
+            writeln!(stdout)?;
+            stdout.flush()?;
+            Ok(false)
+        }
+        Err(error) => {
+            writeln!(stderr, "tc: {name}: {error}")?;
+            Ok(true)
+        }
+    }
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let (inputs, expansion_errors) = expand_inputs(&cli.files);
@@ -72,12 +129,40 @@ fn main() -> ExitCode {
         }
     };
 
-    let results = process_inputs(&inputs, &tokenizer, io::stdin().lock());
-    match write_results(results, io::stdout().lock(), io::stderr().lock()) {
-        Ok(processing_error) => had_error |= processing_error,
-        Err(error) => {
+    if cli.jsonl {
+        let state = Mutex::new((false, None));
+        process_inputs_as_completed(&inputs, &tokenizer, io::stdin().lock(), |result| {
+            let mut state = state.lock().expect("JSONL output state is not poisoned");
+            if state.1.is_some() {
+                return;
+            }
+            match write_jsonl_result(
+                result,
+                cli.show_tokens,
+                cli.show_token_ids,
+                io::stdout().lock(),
+                io::stderr().lock(),
+            ) {
+                Ok(processing_error) => state.0 |= processing_error,
+                Err(error) => state.1 = Some(error),
+            }
+        });
+        let (processing_error, output_error) = state
+            .into_inner()
+            .expect("JSONL output state is not poisoned");
+        had_error |= processing_error;
+        if let Some(error) = output_error {
             eprintln!("tc: {error}");
             had_error = true;
+        }
+    } else {
+        let results = process_inputs(&inputs, &tokenizer, io::stdin().lock());
+        match write_results(results, io::stdout().lock(), io::stderr().lock()) {
+            Ok(processing_error) => had_error |= processing_error,
+            Err(error) => {
+                eprintln!("tc: {error}");
+                had_error = true;
+            }
         }
     }
 
@@ -119,6 +204,31 @@ mod tests {
     }
 
     #[test]
+    fn jsonl_is_opt_in() {
+        let cli = Cli::try_parse_from(["tc", "--jsonl", "input.txt"]).expect("valid arguments");
+
+        assert!(cli.jsonl);
+        assert_eq!(cli.files, ["input.txt"]);
+    }
+
+    #[test]
+    fn token_details_require_jsonl() {
+        assert!(Cli::try_parse_from(["tc", "--show-tokens", "input.txt"]).is_err());
+        assert!(Cli::try_parse_from(["tc", "--show-token-ids", "input.txt"]).is_err());
+
+        let cli = Cli::try_parse_from([
+            "tc",
+            "--jsonl",
+            "--show-tokens",
+            "--show-token-ids",
+            "input.txt",
+        ])
+        .expect("valid arguments");
+        assert!(cli.show_tokens);
+        assert!(cli.show_token_ids);
+    }
+
+    #[test]
     fn formats_stdin_and_totals() {
         let results = vec![
             (Input::Stdin, Ok(10)),
@@ -154,5 +264,45 @@ mod tests {
             String::from_utf8(stderr).unwrap(),
             "tc: missing.txt: not found\n"
         );
+    }
+
+    #[test]
+    fn formats_uniform_jsonl_without_total() {
+        let encoding = load_tokenizer(DEFAULT_MODEL)
+            .unwrap()
+            .encode("hello world", false)
+            .unwrap();
+        let result = (Input::File(PathBuf::from("input.txt")), Ok(encoding));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let had_error = write_jsonl_result(result, false, false, &mut stdout, &mut stderr).unwrap();
+
+        assert!(!had_error);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "{\"path\":\"input.txt\",\"n_tokens\":2}\n"
+        );
+        assert!(stderr.is_empty());
+    }
+
+    #[test]
+    fn jsonl_can_include_token_strings_and_ids() {
+        let encoding = load_tokenizer(DEFAULT_MODEL)
+            .unwrap()
+            .encode("hello world", false)
+            .unwrap();
+        let result = (Input::File(PathBuf::from("input.txt")), Ok(encoding));
+        let mut stdout = Vec::new();
+        let mut stderr = Vec::new();
+
+        let had_error = write_jsonl_result(result, true, true, &mut stdout, &mut stderr).unwrap();
+
+        assert!(!had_error);
+        assert_eq!(
+            String::from_utf8(stdout).unwrap(),
+            "{\"path\":\"input.txt\",\"n_tokens\":2,\"tokens\":[\"hello\",\"Ġworld\"],\"token_ids\":[24912,2375]}\n"
+        );
+        assert!(stderr.is_empty());
     }
 }

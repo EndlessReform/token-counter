@@ -3,7 +3,7 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{self, BufReader, Read};
 use std::path::{Path, PathBuf};
-use tokenizers::Tokenizer;
+use tokenizers::{Encoding, Tokenizer};
 
 pub const DEFAULT_MODEL: &str = "Xenova/gpt-4o";
 const DEFAULT_TOKENIZER_JSON: &[u8] =
@@ -38,12 +38,14 @@ impl Input {
 }
 
 pub type CountResult = (Input, io::Result<usize>);
+pub type EncodingResult = (Input, io::Result<Encoding>);
+
+pub fn encode_tokens(content: &str, tokenizer: &Tokenizer) -> io::Result<Encoding> {
+    tokenizer.encode(content, false).map_err(io::Error::other)
+}
 
 pub fn count_tokens(content: &str, tokenizer: &Tokenizer) -> io::Result<usize> {
-    tokenizer
-        .encode(content, false)
-        .map(|encoding| encoding.len())
-        .map_err(io::Error::other)
+    encode_tokens(content, tokenizer).map(|encoding| encoding.len())
 }
 
 pub fn count_file(path: &Path, tokenizer: &Tokenizer) -> io::Result<usize> {
@@ -51,9 +53,17 @@ pub fn count_file(path: &Path, tokenizer: &Tokenizer) -> io::Result<usize> {
 }
 
 pub fn count_reader(mut reader: impl Read, tokenizer: &Tokenizer) -> io::Result<usize> {
+    encode_reader(&mut reader, tokenizer).map(|encoding| encoding.len())
+}
+
+pub fn encode_file(path: &Path, tokenizer: &Tokenizer) -> io::Result<Encoding> {
+    encode_reader(BufReader::new(File::open(path)?), tokenizer)
+}
+
+pub fn encode_reader(mut reader: impl Read, tokenizer: &Tokenizer) -> io::Result<Encoding> {
     let mut buffer = String::new();
     reader.read_to_string(&mut buffer)?;
-    count_tokens(&buffer, tokenizer)
+    encode_tokens(&buffer, tokenizer)
 }
 
 fn has_glob_metacharacters(value: &str) -> bool {
@@ -71,15 +81,18 @@ pub fn expand_inputs(files: &[String]) -> (Vec<Input>, Vec<String>) {
             match glob(value) {
                 Ok(paths) => {
                     let mut matched = false;
+                    let mut matched_paths = Vec::new();
                     for entry in paths {
                         match entry {
                             Ok(path) => {
                                 matched = true;
-                                inputs.push(Input::File(path));
+                                matched_paths.push(path);
                             }
                             Err(error) => errors.push(format!("{value}: {error}")),
                         }
                     }
+                    matched_paths.sort();
+                    inputs.extend(matched_paths.into_iter().map(Input::File));
                     if !matched {
                         errors.push(format!("{value}: no matches"));
                     }
@@ -137,6 +150,37 @@ pub fn process_inputs(
         .collect()
 }
 
+/// Tokenizes all inputs, emitting stdin results first and file results as they complete.
+///
+/// File result order is intentionally nondeterministic. A repeated `-` observes
+/// EOF after the first read, matching ordinary sequential stream behavior.
+pub fn process_inputs_as_completed(
+    inputs: &[Input],
+    tokenizer: &Tokenizer,
+    mut stdin: impl Read,
+    emit: impl Fn(EncodingResult) + Sync,
+) {
+    let mut stdin_read = false;
+
+    for input in inputs {
+        if input.is_stdin() {
+            let result = if stdin_read {
+                Ok(Encoding::default())
+            } else {
+                stdin_read = true;
+                encode_reader(&mut stdin, tokenizer)
+            };
+            emit((input.clone(), result));
+        }
+    }
+
+    inputs.par_iter().for_each(|input| {
+        if let Input::File(path) = input {
+            emit((input.clone(), encode_file(path, tokenizer)));
+        }
+    });
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,6 +229,22 @@ mod tests {
     }
 
     #[test]
+    fn glob_expansion_is_lexically_ordered() {
+        let files = vec!["src/*.rs".to_owned()];
+
+        let (inputs, errors) = expand_inputs(&files);
+
+        assert!(errors.is_empty());
+        assert_eq!(
+            inputs,
+            [
+                Input::File(PathBuf::from("src/lib.rs")),
+                Input::File(PathBuf::from("src/main.rs")),
+            ]
+        );
+    }
+
+    #[test]
     fn reports_invalid_and_unmatched_globs() {
         let files = vec!["[".to_owned(), "definitely-not-present-*.txt".to_owned()];
 
@@ -221,5 +281,23 @@ mod tests {
             Input::File(PathBuf::from("definitely-not-present.txt"))
         );
         assert!(results[0].1.is_err());
+    }
+
+    #[test]
+    fn completion_processing_emits_every_input() {
+        use std::sync::Mutex;
+
+        let emitted = Mutex::new(Vec::new());
+        process_inputs_as_completed(
+            &[Input::Stdin, Input::Stdin],
+            &test_tokenizer(),
+            Cursor::new("hello world"),
+            |result| emitted.lock().unwrap().push(result),
+        );
+
+        let emitted = emitted.into_inner().unwrap();
+        assert_eq!(emitted.len(), 2);
+        assert_eq!(emitted[0].1.as_ref().unwrap().len(), 10);
+        assert_eq!(emitted[1].1.as_ref().unwrap().len(), 0);
     }
 }
